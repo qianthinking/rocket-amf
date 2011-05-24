@@ -76,11 +76,11 @@ require 'rocketamf/remoting'
 #
 #   run HelloWorldApp.new
 module RocketAMF
-  begin
-    require 'rocketamf/ext'
-  rescue LoadError
+  #begin
+  #  require 'rocketamf/ext'
+  #rescue LoadError
     require 'rocketamf/pure'
-  end
+  #end
 
   # Deserialize the AMF string _source_ of the given AMF version into a Ruby
   # data structure and return it
