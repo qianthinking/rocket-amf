@@ -382,10 +382,8 @@ module RocketAMF
       include RocketAMF::Pure::WriteIOHelpers
 
       def write_utf8_vr str, encode=true
-        if str.respond_to?(:encode)
-          unless encode
-            str = str.dup if str.frozen?
-          end
+        if str.respond_to?(:force_encoding)
+          str = str.dup if str.frozen?
           str.force_encoding("ASCII-8BIT")
         end
 
