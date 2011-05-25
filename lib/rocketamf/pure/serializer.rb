@@ -331,7 +331,7 @@ module RocketAMF
         class_name = traits[:class_name]
 
         # Write out traits
-        if class_name && @trait_cache[class_name] != nil
+        if false && class_name && @trait_cache[class_name] != nil
           @stream << pack_integer(@trait_cache[class_name] << 2 | 0x01)
         else
           @trait_cache.add_obj class_name if class_name
