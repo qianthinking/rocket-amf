@@ -338,7 +338,7 @@ module RocketAMF
                       :externalizable => externalizable,
                       :dynamic => dynamic
                      }
-            @trait_cache << traits unless class_name.nil? || class_name.size == 0
+            @trait_cache << traits #unless class_name.nil? || class_name.size == 0
           end
 
           # Optimization for deserializing ArrayCollection
