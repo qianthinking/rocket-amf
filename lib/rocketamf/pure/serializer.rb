@@ -328,13 +328,13 @@ module RocketAMF
                     :dynamic => true
                    }
         end
-        class_name = traits[:class_name]
+        class_name = traits[:class_name].to_s
 
         # Write out traits
         if false && class_name && @trait_cache[class_name] != nil
           @stream << pack_integer(@trait_cache[class_name] << 2 | 0x01)
         else
-          @trait_cache.add_obj class_name if class_name
+          @trait_cache.add_obj class_name if class_name.present?
 
           # Write out trait header
           header = 0x03 # Not object ref and not trait ref
@@ -344,7 +344,10 @@ module RocketAMF
           @stream << pack_integer(header)
 
           # Write out class name
-          write_utf8_vr(class_name.to_s)
+          # write_utf8_vr(class_name.to_s)
+          # don't cache class name for whole object amf cache
+          @stream << pack_integer(class_name.bytesize << 1 | 1)
+          @stream << class_name
 
           # Write out members
           traits[:members].each {|m| write_utf8_vr(m)}
