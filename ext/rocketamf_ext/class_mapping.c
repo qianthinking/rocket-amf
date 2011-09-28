@@ -1,15 +1,24 @@
 #include <ruby.h>
+#ifdef HAVE_RB_STR_ENCODE
 #include <ruby/st.h>
+#else
+#include <st.h>
+#endif
 #include "utility.h"
 
 extern VALUE mRocketAMF;
 extern VALUE mRocketAMFExt;
 VALUE cFastMappingSet;
 VALUE cTypedHash;
+ID id_use_ac;
+ID id_use_ac_ivar;
+ID id_mappings;
+ID id_mappings_ivar;
 ID id_hashset;
 
 typedef struct {
     VALUE mapset;
+    st_table* setter_cache;
     st_table* prop_cache;
 } CLASS_MAPPING;
 
@@ -48,20 +57,61 @@ static VALUE mapset_alloc(VALUE klass) {
     set->as_mappings = st_init_strtable();
     set->rb_mappings = st_init_strtable();
 
-    // Populate with built-in mappings
-    st_add_direct(set->as_mappings, (st_data_t)"flex.messaging.messages.AbstractMessage", rb_str_new2("RocketAMF::Values::AbstractMessage"));
-    st_add_direct(set->as_mappings, (st_data_t)"flex.messaging.messages.RemotingMessage", rb_str_new2("RocketAMF::Values::RemotingMessage"));
-    st_add_direct(set->as_mappings, (st_data_t)"flex.messaging.messages.AsyncMessage", rb_str_new2("RocketAMF::Values::AsyncMessage"));
-    st_add_direct(set->as_mappings, (st_data_t)"flex.messaging.messages.CommandMessage", rb_str_new2("RocketAMF::Values::CommandMessage"));
-    st_add_direct(set->as_mappings, (st_data_t)"flex.messaging.messages.AcknowledgeMessage", rb_str_new2("RocketAMF::Values::AcknowledgeMessage"));
-    st_add_direct(set->as_mappings, (st_data_t)"flex.messaging.messages.ErrorMessage", rb_str_new2("RocketAMF::Values::ErrorMessage"));
+    return self;
+}
 
-    st_add_direct(set->rb_mappings, (st_data_t)"RocketAMF::Values::AbstractMessage", rb_str_new2("flex.messaging.messages.AbstractMessage"));
-    st_add_direct(set->rb_mappings, (st_data_t)"RocketAMF::Values::RemotingMessage", rb_str_new2("flex.messaging.messages.RemotingMessage"));
-    st_add_direct(set->rb_mappings, (st_data_t)"RocketAMF::Values::AsyncMessage", rb_str_new2("flex.messaging.messages.AsyncMessage"));
-    st_add_direct(set->rb_mappings, (st_data_t)"RocketAMF::Values::CommandMessage", rb_str_new2("flex.messaging.messages.CommandMessage"));
-    st_add_direct(set->rb_mappings, (st_data_t)"RocketAMF::Values::AcknowledgeMessage", rb_str_new2("flex.messaging.messages.AcknowledgeMessage"));
-    st_add_direct(set->rb_mappings, (st_data_t)"RocketAMF::Values::ErrorMessage", rb_str_new2("flex.messaging.messages.ErrorMessage"));
+/*
+ * call-seq:
+ *   RocketAMF::Ext::MappingSet.new
+ *
+ * Creates a mapping set object and populates the default mappings
+ */
+static VALUE mapset_init(VALUE self) {
+    rb_funcall(self, rb_intern("map_defaults"), 0);
+    return self;
+}
+
+/*
+ * call-seq:
+ *   m.map_defaults
+ *
+ * Adds required mapping configs, calling map for the required base mappings
+ */
+static VALUE mapset_map_defaults(VALUE self) {
+    const int NUM_MAPPINGS = 9;
+    char* ruby_classes[] = {
+        "RocketAMF::Values::AbstractMessage",
+        "RocketAMF::Values::RemotingMessage",
+        "RocketAMF::Values::AsyncMessage",
+        "RocketAMF::Values::AsyncMessageExt",
+        "RocketAMF::Values::CommandMessage",
+        "RocketAMF::Values::CommandMessageExt",
+        "RocketAMF::Values::AcknowledgeMessage",
+        "RocketAMF::Values::AcknowledgeMessageExt",
+        "RocketAMF::Values::ErrorMessage"
+    };
+    char* as_classes[] = {
+        "flex.messaging.messages.AbstractMessage",
+        "flex.messaging.messages.RemotingMessage",
+        "flex.messaging.messages.AsyncMessage",
+        "DSA",
+        "flex.messaging.messages.CommandMessage",
+        "DSC",
+        "flex.messaging.messages.AcknowledgeMessage",
+        "DSK",
+        "flex.messaging.messages.ErrorMessage"
+    };
+
+    int i;
+    ID map_id = rb_intern("map");
+    VALUE params = rb_hash_new();
+    VALUE as_sym = ID2SYM(rb_intern("as"));
+    VALUE ruby_sym = ID2SYM(rb_intern("ruby"));
+    for(i = 0; i < NUM_MAPPINGS; i++) {
+        rb_hash_aset(params, as_sym, rb_str_new2(as_classes[i]));
+        rb_hash_aset(params, ruby_sym, rb_str_new2(ruby_classes[i]));
+        rb_funcall(self, map_id, 1, params);
+    }
 
     return self;
 }
@@ -129,6 +179,7 @@ static void mapping_mark(CLASS_MAPPING *map) {
  * Free prop cache table and struct
  */
 static void mapping_free(CLASS_MAPPING *map) {
+    st_free_table(map->setter_cache);
     st_free_table(map->prop_cache);
     xfree(map);
 }
@@ -140,16 +191,40 @@ static VALUE mapping_alloc(VALUE klass) {
     CLASS_MAPPING *map = ALLOC(CLASS_MAPPING);
     memset(map, 0, sizeof(CLASS_MAPPING));
     VALUE self = Data_Wrap_Struct(klass, mapping_mark, mapping_free, map);
-    map->mapset = rb_class_new_instance(0, NULL, cFastMappingSet);
+    map->setter_cache = st_init_numtable();
     map->prop_cache = st_init_numtable();
     return self;
 }
 
 /*
- * Initialize class mapping object, setting use_class_mapping to false
+ * Class-level getter for use_array_collection
  */
-static VALUE mapping_init(VALUE self) {
-    rb_ivar_set(self, rb_intern("@use_array_collection"), Qfalse);
+static VALUE mapping_s_array_collection_get(VALUE klass) {
+    VALUE use_ac = rb_ivar_get(klass, id_use_ac_ivar);
+    if(use_ac == Qnil) {
+        use_ac = Qfalse;
+        rb_ivar_set(klass, id_use_ac_ivar, use_ac);
+    }
+    return use_ac;
+}
+
+/*
+ * Class-level setter for use_array_collection
+ */
+static VALUE mapping_s_array_collection_set(VALUE klass, VALUE use_ac) {
+    return rb_ivar_set(klass, id_use_ac_ivar, use_ac);
+}
+
+/*
+ * Return MappingSet for class mapper, creating if uninitialized
+ */
+static VALUE mapping_s_mappings(VALUE klass) {
+    VALUE mappings = rb_ivar_get(klass, id_mappings_ivar);
+    if(mappings == Qnil) {
+        mappings = rb_class_new_instance(0, NULL, cFastMappingSet);
+        rb_ivar_set(klass, id_mappings_ivar, mappings);
+    }
+    return mappings;
 }
 
 /*
@@ -159,27 +234,33 @@ static VALUE mapping_init(VALUE self) {
  * Define class mappings in the block. Block is passed a MappingSet object as
  * the first parameter. See RocketAMF::ClassMapping for details.
  */
-static VALUE mapping_define(VALUE self) {
-    CLASS_MAPPING *map;
-    Data_Get_Struct(self, CLASS_MAPPING, map);
-
-	if (rb_block_given_p()) {
-	    rb_yield(map->mapset);
-	}
-
-	return Qnil;
+static VALUE mapping_s_define(VALUE klass) {
+    if (rb_block_given_p()) {
+        VALUE mappings = rb_funcall(klass, id_mappings, 0);
+        rb_yield(mappings);
+    }
+    return Qnil;
 }
 
 /*
  * Reset class mappings
  */
-static VALUE mapping_reset(VALUE self) {
+static VALUE mapping_s_reset(VALUE klass) {
+    rb_ivar_set(klass, id_use_ac_ivar, Qfalse);
+    rb_ivar_set(klass, id_mappings_ivar, Qnil);
+    return Qnil;
+}
+
+/*
+ * Initialize class mapping object, setting use_class_mapping to false
+ */
+static VALUE mapping_init(VALUE self) {
     CLASS_MAPPING *map;
     Data_Get_Struct(self, CLASS_MAPPING, map);
-
-    map->mapset = rb_class_new_instance(0, NULL, cFastMappingSet);
-
-    return Qnil;
+    map->mapset = rb_funcall(CLASS_OF(self), id_mappings, 0);
+    VALUE use_ac = rb_funcall(CLASS_OF(self), id_use_ac, 0);
+    rb_ivar_set(self, id_use_ac_ivar, use_ac);
+    return self;
 }
 
 /*
@@ -248,24 +329,38 @@ static VALUE mapping_get_ruby_obj(VALUE self, VALUE name) {
 /*
  * st_table iterator for populating a given object from a property hash
  */
-static int mapping_populate_iter(VALUE key, VALUE val, VALUE obj) {
+static int mapping_populate_iter(VALUE key, VALUE val, const VALUE args[2]) {
+    CLASS_MAPPING *map;
+    Data_Get_Struct(args[0], CLASS_MAPPING, map);
+    VALUE obj = args[1];
+
     if(TYPE(obj) == T_HASH) {
         rb_hash_aset(obj, key, val);
         return ST_CONTINUE;
     }
 
     if(TYPE(key) != T_SYMBOL) rb_raise(rb_eArgError, "Invalid type for property key: %d", TYPE(key));
-    const char* key_str = rb_id2name(SYM2ID(key));
-    long len = strlen(key_str);
-    char* setter = ALLOC_N(char, len+2);
-    memcpy(setter, key_str, len);
-    setter[len] = '=';
-    setter[len+1] = '\0';
-    ID id_setter = rb_intern(setter);
-    xfree(setter);
 
-    if(rb_respond_to(obj, id_setter)) {
-        rb_funcall(obj, id_setter, 1, val);
+    // Calculate symbol for setter function
+    ID key_id = SYM2ID(key);
+    ID setter_id;
+    if(!st_lookup(map->setter_cache, key_id, &setter_id)) {
+        // Calculate symbol
+        const char* key_str = rb_id2name(key_id);
+        long len = strlen(key_str);
+        char* setter = ALLOC_N(char, len+2);
+        memcpy(setter, key_str, len);
+        setter[len] = '=';
+        setter[len+1] = '\0';
+        setter_id = rb_intern(setter);
+        xfree(setter);
+
+        // Store it
+        st_add_direct(map->setter_cache, key_id, setter_id);
+    }
+
+    if(rb_respond_to(obj, setter_id)) {
+        rb_funcall(obj, setter_id, 1, val);
     } else if(rb_respond_to(obj, id_hashset)) {
         rb_funcall(obj, id_hashset, 2, key, val);
     }
@@ -285,9 +380,10 @@ static VALUE mapping_populate(int argc, VALUE *argv, VALUE self) {
     VALUE obj, props, dynamic_props;
     rb_scan_args(argc, argv, "21", &obj, &props, &dynamic_props);
 
-    st_foreach(RHASH_TBL(props), mapping_populate_iter, obj);
+    VALUE args[2] = {self, obj};
+    st_foreach(RHASH_TBL(props), mapping_populate_iter, (st_data_t)args);
     if(dynamic_props != Qnil) {
-        st_foreach(RHASH_TBL(dynamic_props), mapping_populate_iter, obj);
+        st_foreach(RHASH_TBL(dynamic_props), mapping_populate_iter, (st_data_t)args);
     }
 
     return obj;
@@ -339,7 +435,9 @@ static VALUE mapping_props(VALUE self, VALUE obj) {
     VALUE props = rb_hash_new();
     len = RARRAY_LEN(props_ary);
     for(i = 0; i < len; i++) {
-        rb_hash_aset(props, RARRAY_PTR(props_ary)[i], rb_funcall(obj, rb_intern("send"), 1, RARRAY_PTR(props_ary)[i]));
+        VALUE key = RARRAY_PTR(props_ary)[i];
+        ID getter = (TYPE(key) == T_STRING) ? rb_intern(RSTRING_PTR(key)) : SYM2ID(key);
+        rb_hash_aset(props, key, rb_funcall(obj, getter, 0));
     }
 
     return props;
@@ -349,15 +447,20 @@ void Init_rocket_amf_fast_class_mapping() {
     // Define map set
     cFastMappingSet = rb_define_class_under(mRocketAMFExt, "FastMappingSet", rb_cObject);
     rb_define_alloc_func(cFastMappingSet, mapset_alloc);
+    rb_define_method(cFastMappingSet, "initialize", mapset_init, 0);
+    rb_define_method(cFastMappingSet, "map_defaults", mapset_map_defaults, 0);
     rb_define_method(cFastMappingSet, "map", mapset_map, 1);
 
     // Define FastClassMapping
     VALUE cFastClassMapping = rb_define_class_under(mRocketAMFExt, "FastClassMapping", rb_cObject);
     rb_define_alloc_func(cFastClassMapping, mapping_alloc);
-    rb_attr(cFastClassMapping, rb_intern("use_array_collection"), 1, 1, Qtrue);
+    rb_define_singleton_method(cFastClassMapping, "use_array_collection", mapping_s_array_collection_get, 0);
+    rb_define_singleton_method(cFastClassMapping, "use_array_collection=", mapping_s_array_collection_set, 1);
+    rb_define_singleton_method(cFastClassMapping, "mappings", mapping_s_mappings, 0);
+    rb_define_singleton_method(cFastClassMapping, "reset", mapping_s_reset, 0);
+    rb_define_singleton_method(cFastClassMapping, "define", mapping_s_define, 0);
+    rb_define_attr(cFastClassMapping, "use_array_collection", 1, 0);
     rb_define_method(cFastClassMapping, "initialize", mapping_init, 0);
-    rb_define_method(cFastClassMapping, "define", mapping_define, 0);
-    rb_define_method(cFastClassMapping, "reset", mapping_reset, 0);
     rb_define_method(cFastClassMapping, "get_as_class_name", mapping_as_class_name, 1);
     rb_define_method(cFastClassMapping, "get_ruby_obj", mapping_get_ruby_obj, 1);
     rb_define_method(cFastClassMapping, "populate_ruby_obj", mapping_populate, -1);
@@ -365,5 +468,9 @@ void Init_rocket_amf_fast_class_mapping() {
 
     // Cache values
     cTypedHash = rb_const_get(rb_const_get(mRocketAMF, rb_intern("Values")), rb_intern("TypedHash"));
+    id_use_ac = rb_intern("use_array_collection");
+    id_use_ac_ivar = rb_intern("@use_array_collection");
+    id_mappings = rb_intern("mappings");
+    id_mappings_ivar = rb_intern("@mappings");
     id_hashset = rb_intern("[]=");
 }

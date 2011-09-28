@@ -9,27 +9,68 @@ module RocketAMF
       @messages = props[:messages] || []
     end
 
-    # Populates the envelope from the given stream or string. Returns self for easy
-    # chaining.
+    # Populates the envelope from the given stream or string using the given
+    # class mapper, or creates a new one. Returns self for easy chaining.
     #
     # Example:
     #
     #    req = RocketAMF::Envelope.new.populate_from_stream(env['rack.input'].read)
     #--
     # Implemented in pure/remoting.rb RocketAMF::Pure::Envelope
-    def populate_from_stream stream
+    def populate_from_stream stream, class_mapper=nil
       raise AMFError, 'Must load "rocketamf/pure"'
     end
 
-    # Serializes the envelope to a string and returns it
+    # Creates the appropriate message and adds it to <tt>messages</tt> to call
+    # the given target using the standard (old) remoting APIs. You can call multiple
+    # targets in the same request, unlike with the flex remotings APIs.
+    #
+    # Example:
+    #
+    #    req = RocketAMF::Envelope.new
+    #    req.call 'test', "arg_1", ["args", "args"]
+    #    req.call 'Controller.action'
+    def call target, *args
+      raise "Cannot use different call types" unless @call_type.nil? || @call_type == :simple
+      @call_type = :simple
+
+      msg_num = messages.length+1
+      @messages << RocketAMF::Message.new(target, "/#{msg_num}", args)
+    end
+
+    # Creates the appropriate message and adds it to <tt>messages</tt> using the
+    # new flex (RemoteObject) remoting APIs. You can only make one flex remoting
+    # call per envelope, and the AMF version must be set to 3.
+    #
+    # Example:
+    #
+    #    req = RocketAMF::Envelope.new
+    #    req.call_flex 'Controller.action', "arg_1", ["args", "args"]
+    def call_flex target, *args
+      raise "Can only call one flex target per request" if @call_type == :flex
+      raise "Cannot use different call types" if @call_type == :simple
+      raise "Cannot use flex remoting calls with AMF0" if @amf_version != 3
+      @call_type = :flex
+
+      flex_msg = RocketAMF::Values::RemotingMessage.new
+      target_parts = target.split(".")
+      flex_msg.operation = target_parts.pop # Use pop so that a missing source is possible without issues
+      flex_msg.source = target_parts.pop
+      flex_msg.body = args
+      @messages << RocketAMF::Message.new('null', '/2', flex_msg) # /2 because it always sends a command message before
+    end
+
+    # Serializes the envelope to a string using the given class mapper, or creates
+    # a new one, and returns the result
     #--
     # Implemented in pure/remoting.rb RocketAMF::Pure::Envelope
-    def serialize
+    def serialize class_mapper=nil
       raise AMFError, 'Must load "rocketamf/pure"'
     end
 
     # Builds response from the request, iterating over each method call and using
-    # the return value as the method call's return value
+    # the return value as the method call's return value. Marks as envelope as
+    # constructed after running.
     #--
     # Iterate over all the sent messages. If they're somthing we can handle, like
     # a command message, then simply add the response message ourselves. If it's
@@ -84,6 +125,32 @@ module RocketAMF
       @constructed = true
     end
 
+    # Returns the result of a response envelope, or an array of results if there
+    # are multiple action call messages. It automatically unwraps flex-style
+    # RemoteObject response messages, where the response result is inside a
+    # RocketAMF::Values::AcknowledgeMessage.
+    #
+    # Example:
+    #
+    #    req = RocketAMF::Envelope.new
+    #    req.call('TestController.test', 'first_arg', 'second_arg')
+    #    res = RocketAMF::Envelope.new
+    #    res.each_method_call req do |method, args|
+    #      ['a', 'b']
+    #    end
+    #    res.result     #=> ['a', 'b']
+    def result
+      results = []
+      messages.each do |msg|
+        if msg.data.is_a?(Values::AcknowledgeMessage)
+          results << msg.data.body
+        else
+          results << msg.data
+        end
+      end
+      results.length > 1 ? results : results[0]
+    end
+
     # Whether or not the response has been constructed. Can be used to prevent
     # serialization when no processing has taken place.
     def constructed?
@@ -95,28 +162,13 @@ module RocketAMF
       serialize
     end
 
-    private
-    def dispatch_call p
+    def dispatch_call p #:nodoc:
       begin
         p[:block].call(p[:method], p[:args])
       rescue Exception => e
         # Create ErrorMessage object using the source message as the base
         Values::ErrorMessage.new(p[:source], e)
       end
-    end
-  end
-
-  class Request < Envelope #:nodoc:
-    def initialize props={}
-      $stderr.puts("DEPRECATION WARNING: Use RocketAMF::Envelope instead of RocketAMF::Request")
-      super(props)
-    end
-  end
-
-  class Response < Envelope #:nodoc:
-    def initialize props={}
-      $stderr.puts("DEPRECATION WARNING: Use RocketAMF::Envelope instead of RocketAMF::Request")
-      super(props)
     end
   end
 

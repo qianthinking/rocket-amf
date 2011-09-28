@@ -5,7 +5,6 @@
 extern VALUE mRocketAMF;
 extern VALUE mRocketAMFExt;
 extern VALUE cSerializer;
-extern VALUE cAMF3Serializer;
 extern VALUE cStringIO;
 extern VALUE cDate;
 extern VALUE cDateTime;
@@ -14,7 +13,6 @@ extern VALUE sym_members;
 extern VALUE sym_externalizable;
 extern VALUE sym_dynamic;
 VALUE cArrayCollection;
-ID id_size;
 ID id_haskey;
 ID id_encode_amf;
 ID id_is_array_collection;
@@ -23,38 +21,10 @@ ID id_get_as_class_name;
 ID id_props_for_serialization;
 ID id_utc;
 ID id_to_f;
+ID id_is_integer;
 
-/*
- * Mark the stream
- */
-static void ser_mark(AMF_SERIALIZER *ser) {
-    if(!ser) return;
-    rb_gc_mark(ser->stream);
-}
-
-/*
- * Free cache tables, stream and the struct itself
- */
-static void ser_free(AMF_SERIALIZER *ser) {
-    if(ser->str_cache) st_free_table(ser->str_cache);
-    if(ser->trait_cache) st_free_table(ser->trait_cache);
-    if(ser->obj_cache) st_free_table(ser->obj_cache);
-    xfree(ser);
-}
-
-/*
- * Create new struct and wrap with class
- */
-static VALUE ser_alloc(VALUE klass) {
-    // Allocate struct
-    AMF_SERIALIZER *ser = ALLOC(AMF_SERIALIZER);
-    memset(ser, 0, sizeof(AMF_SERIALIZER));
-
-    // Initialize stream
-    ser->stream = rb_str_buf_new(0);
-
-    return Data_Wrap_Struct(klass, ser_mark, ser_free, ser);
-}
+static VALUE ser0_serialize(VALUE self, VALUE obj);
+static VALUE ser3_serialize(VALUE self, VALUE obj);
 
 void ser_write_byte(AMF_SERIALIZER *ser, char byte) {
     char bytes[2] = {byte, '\0'};
@@ -143,27 +113,7 @@ void ser_get_string(VALUE obj, VALUE encode, char** str, long* len) {
     }
 }
 
-static VALUE ser_stream(VALUE self) {
-    AMF_SERIALIZER *ser;
-    Data_Get_Struct(self, AMF_SERIALIZER, ser);
-    return ser->stream;
-}
-
 /*
- * call-seq:
- *   ser.version => 0
- *
- * Returns the serializer version number, so that a custom encode_amf method
- * knows which version to encode for
- */
-static VALUE ser0_version(VALUE self) {
-    return INT2FIX(0);
-}
-
-/*
- * call-seq:
- *   ser.write_array(ary) => ser
- *
  * Write the given array in AMF0 notation
  */
 static VALUE ser0_write_array(VALUE self, VALUE ary) {
@@ -171,8 +121,7 @@ static VALUE ser0_write_array(VALUE self, VALUE ary) {
     Data_Get_Struct(self, AMF_SERIALIZER, ser);
 
     // Cache it
-    VALUE obj_id = rb_obj_id(ary);
-    st_add_direct(ser->obj_cache, obj_id, LONG2FIX(ser->obj_index));
+    st_add_direct(ser->obj_cache, ary, LONG2FIX(ser->obj_index));
     ser->obj_index++;
 
     // Write it out
@@ -212,13 +161,13 @@ static void ser0_write_string(AMF_SERIALIZER *ser, VALUE obj, VALUE write_marker
  * Hash iterator for object properties that writes the key and then serializes
  * the value
  */
-static int ser0_hash_iter(VALUE key, VALUE val, ITER_ARGS *args) {
+static int ser0_hash_iter(VALUE key, VALUE val, const VALUE args[1]) {
     AMF_SERIALIZER *ser;
-    Data_Get_Struct(args->ser, AMF_SERIALIZER, ser);
+    Data_Get_Struct(args[0], AMF_SERIALIZER, ser);
 
     // Write key and value
     ser0_write_string(ser, key, Qfalse); // Technically incorrect if key length is longer than a 16 bit string, but if you run into that you're screwed anyways
-    ser0_serialize(args->ser, val);
+    ser0_serialize(args[0], val);
 
     return ST_CONTINUE;
 }
@@ -229,72 +178,46 @@ static int ser0_hash_iter(VALUE key, VALUE val, ITER_ARGS *args) {
  * sorting must be enabled by an explicit call to extconf.rb, so the tests will
  * not pass typically on Ruby 1.8.
  */
-static VALUE ser0_write_object0(VALUE self, VALUE obj, VALUE props) {
-    static VALUE class_mapper = 0;
-    if(class_mapper == 0) class_mapper = rb_const_get(mRocketAMF, rb_intern("ClassMapper"));
+static VALUE ser0_write_object(VALUE self, VALUE obj, VALUE props) {
     AMF_SERIALIZER *ser;
     Data_Get_Struct(self, AMF_SERIALIZER, ser);
 
     // Cache it
-    VALUE obj_id = rb_obj_id(obj);
-    st_add_direct(ser->obj_cache, obj_id, LONG2FIX(ser->obj_index));
+    st_add_direct(ser->obj_cache, obj, LONG2FIX(ser->obj_index));
     ser->obj_index++;
 
     // Make a request for props hash unless we already have it
     if(props == Qnil) {
-        props = rb_funcall(class_mapper, id_props_for_serialization, 1, obj);
+        props = rb_funcall(ser->class_mapper, id_props_for_serialization, 1, obj);
     }
 
     // Write header
-    VALUE class_name = rb_funcall(class_mapper, id_get_as_class_name, 1, obj);
+    VALUE class_name = rb_funcall(ser->class_mapper, id_get_as_class_name, 1, obj);
     if(class_name != Qnil) {
         ser_write_byte(ser, AMF0_TYPED_OBJECT_MARKER);
         ser0_write_string(ser, class_name, Qfalse);
-    } else if(TYPE(obj) == T_HASH) {
-        VALUE size = rb_funcall(obj, id_size, 0);
-        ser_write_byte(ser, AMF0_HASH_MARKER);
-        ser_write_uint32(ser, FIX2LONG(size));
     } else {
         ser_write_byte(ser, AMF0_OBJECT_MARKER);
     }
 
     // Write out data
-    ITER_ARGS args;
-    args.ser = self;
+    VALUE args[1] = {self};
 #ifdef SORT_PROPS
     // Sort is required prior to Ruby 1.9 to pass all the tests, as Ruby 1.8 hashes don't store insert order
     VALUE sorted_props = rb_funcall(props, rb_intern("sort"), 0);
     long i, len = RARRAY_LEN(sorted_props);
     for(i = 0; i < len; i++) {
         VALUE pair = RARRAY_PTR(sorted_props)[i];
-        ser0_hash_iter(RARRAY_PTR(pair)[0], RARRAY_PTR(pair)[1], &args);
+        ser0_hash_iter(RARRAY_PTR(pair)[0], RARRAY_PTR(pair)[1], args);
     }
 #else
-    rb_hash_foreach(props, ser0_hash_iter, (st_data_t)&args);
+    rb_hash_foreach(props, ser0_hash_iter, (st_data_t)args);
 #endif
 
     ser_write_uint16(ser, 0);
     ser_write_byte(ser, AMF0_OBJECT_END_MARKER);
 
     return self;
-}
-
-/*
- * call-seq:
- *   ser.write_object(obj, props=nil) => ser
- *   ser.write_hash(obj) => ser
- *
- * Write the given object or hash using AMF0 notation. If given a props hash,
- * uses that instead of using the class mapper to calculate it.
- */
-static VALUE ser0_write_object(int argc, VALUE *argv, VALUE self) {
-    // Check args
-    VALUE obj;
-    VALUE props = Qnil;
-    rb_scan_args(argc, argv, "11", &obj, &props);
-
-    // Call to internal write_object
-    return ser0_write_object0(self, obj, props);
 }
 
 static VALUE ser0_write_time(VALUE self, VALUE time) {
@@ -324,21 +247,11 @@ static VALUE ser0_write_date(VALUE self, VALUE date) {
 }
 
 /*
- * call-seq:
- *   ser.serialize(obj) =>str
- *
  * Serializes the object to a string and returns that string
  */
-VALUE ser0_serialize(VALUE self, VALUE obj) {
+static VALUE ser0_serialize(VALUE self, VALUE obj) {
     AMF_SERIALIZER *ser;
     Data_Get_Struct(self, AMF_SERIALIZER, ser);
-
-    if(ser->depth == 0) {
-        // Initialize caches
-        ser->obj_cache = st_init_numtable();
-        ser->obj_index = 0;
-    }
-    ser->depth++;
 
     int type = TYPE(obj);
     VALUE klass = Qnil;
@@ -346,21 +259,17 @@ VALUE ser0_serialize(VALUE self, VALUE obj) {
         klass = CLASS_OF(obj);
     }
 
-    VALUE obj_id = rb_obj_id(obj);
     VALUE obj_index;
-    if(st_lookup(ser->obj_cache, obj_id, &obj_index)) {
+    if(st_lookup(ser->obj_cache, obj, &obj_index)) {
         ser_write_byte(ser, AMF0_REFERENCE_MARKER);
         ser_write_uint16(ser, FIX2LONG(obj_index));
     } else if(rb_respond_to(obj, id_encode_amf)) {
         rb_funcall(obj, id_encode_amf, 1, self);
     } else if(type == T_STRING || type == T_SYMBOL) {
         ser0_write_string(ser, obj, Qtrue);
-    } else if(type == T_FIXNUM) {
+    } else if(rb_obj_is_kind_of(obj, rb_cNumeric)) {
         ser_write_byte(ser, AMF0_NUMBER_MARKER);
-        ser_write_double(ser, (double)FIX2LONG(obj));
-    } else if(type == T_FLOAT) {
-        ser_write_byte(ser, AMF0_NUMBER_MARKER);
-        ser_write_double(ser, RFLOAT_VALUE(obj));
+        ser_write_double(ser, RFLOAT_VALUE(rb_Float(obj)));
     } else if(type == T_NIL) {
         ser_write_byte(ser, AMF0_NULL_MARKER);
     } else if(type == T_TRUE || type == T_FALSE) {
@@ -372,32 +281,11 @@ VALUE ser0_serialize(VALUE self, VALUE obj) {
         ser0_write_time(self, obj);
     } else if(klass == cDate || klass == cDateTime) {
         ser0_write_date(self, obj);
-    } else if(type == T_BIGNUM) {
-        ser_write_byte(ser, AMF0_NUMBER_MARKER);
-        ser_write_double(ser, rb_big2dbl(obj));
     } else if(type == T_HASH || type == T_OBJECT) {
-        ser0_write_object0(self, obj, Qnil);
+        ser0_write_object(self, obj, Qnil);
     }
 
-    ser->depth--;
-
-    if(ser->depth == 0) {
-        // Clean up
-        xfree(ser->obj_cache);
-        ser->obj_cache = NULL;
-    }
     return ser->stream;
-}
-
-/*
- * call-seq:
- *   ser.version => 3
- *
- * Returns the serializer version number, so that a custom encode_amf method
- * knows which version to encode for
- */
-static VALUE ser3_version(VALUE self) {
-    return INT2FIX(3);
 }
 
 /*
@@ -426,14 +314,37 @@ static void ser3_write_utf8vr(AMF_SERIALIZER *ser, VALUE obj) {
 }
 
 /*
- * call-seq:
- *   ser.write_array(ary) => ser
- *
+ * Writes Numeric conforming object using AMF3 notation
+ */
+static void ser3_write_numeric(AMF_SERIALIZER *ser, VALUE num) {
+    // Is it an integer in range?
+    if(rb_funcall(num, id_is_integer, 0) == Qtrue) {
+        // It's an integer internally, so now we need to check if it's in range
+        VALUE int_obj = rb_Integer(num);
+        if(TYPE(int_obj) == T_FIXNUM) {
+            long long_val = FIX2LONG(int_obj);
+            if(long_val < MIN_INTEGER || long_val > MAX_INTEGER) {
+                // Outside range, but we have a value already, so just cast to double
+                ser_write_byte(ser, AMF3_DOUBLE_MARKER);
+                ser_write_double(ser, (double)long_val);
+            } else {
+                // Inside valid integer range
+                ser_write_byte(ser, AMF3_INTEGER_MARKER);
+                ser_write_int(ser, (int)long_val);
+            }
+            return;
+        }
+    }
+
+    // It's either not an integer or out of range, so write as a double
+    ser_write_byte(ser, AMF3_DOUBLE_MARKER);
+    ser_write_double(ser, RFLOAT_VALUE(rb_Float(num)));
+}
+
+/*
  * Writes the given array using AMF3 notation
  */
 static VALUE ser3_write_array(VALUE self, VALUE ary) {
-    static VALUE class_mapper = 0;
-    if(class_mapper == 0) class_mapper = rb_const_get(mRocketAMF, rb_intern("ClassMapper"));
     AMF_SERIALIZER *ser;
     Data_Get_Struct(self, AMF_SERIALIZER, ser);
 
@@ -442,20 +353,19 @@ static VALUE ser3_write_array(VALUE self, VALUE ary) {
     if(rb_respond_to(ary, id_is_array_collection)) {
         is_ac = rb_funcall(ary, id_is_array_collection, 0);
     } else {
-        is_ac = rb_funcall(class_mapper, id_use_array_collection, 0);
+        is_ac = rb_funcall(ser->class_mapper, id_use_array_collection, 0);
     }
 
     // Write type marker
     ser_write_byte(ser, is_ac ? AMF3_OBJECT_MARKER : AMF3_ARRAY_MARKER);
 
     // Write object ref, or cache it
-    VALUE obj_id = rb_obj_id(ary);
     VALUE obj_index;
-    if(st_lookup(ser->obj_cache, obj_id, &obj_index)) {
+    if(st_lookup(ser->obj_cache, ary, &obj_index)) {
         ser_write_int(ser, FIX2INT(obj_index) << 1);
         return self;
     } else {
-        st_add_direct(ser->obj_cache, obj_id, LONG2FIX(ser->obj_index));
+        st_add_direct(ser->obj_cache, ary, LONG2FIX(ser->obj_index));
         ser->obj_index++;
         if(is_ac) ser->obj_index++; // The array collection source array
     }
@@ -493,14 +403,14 @@ static VALUE ser3_write_array(VALUE self, VALUE ary) {
  * AMF3 property hash write iterator. Checks the args->extra hash, if given,
  * and skips properties that are keys in that hash.
  */
-static int ser3_hash_iter(VALUE key, VALUE val, ITER_ARGS *args) {
+static int ser3_hash_iter(VALUE key, VALUE val, const VALUE args[2]) {
     AMF_SERIALIZER *ser;
-    Data_Get_Struct(args->ser, AMF_SERIALIZER, ser);
+    Data_Get_Struct(args[0], AMF_SERIALIZER, ser);
 
-    if(args->extra == Qnil || rb_funcall(args->extra, id_haskey, 1, key) == Qfalse) {
+    if(args[1] == Qnil || rb_funcall(args[1], id_haskey, 1, key) == Qfalse) {
         // Write key and value
         ser3_write_utf8vr(ser, key);
-        ser3_serialize(args->ser, val);
+        ser3_serialize(args[0], val);
     }
     return ST_CONTINUE;
 }
@@ -513,9 +423,7 @@ static int ser3_hash_iter(VALUE key, VALUE val, ITER_ARGS *args) {
  * also pass that in, or pass Qnil to use the default traits - dynamic with no
  * defined members.
  */
-static VALUE ser3_write_object0(VALUE self, VALUE obj, VALUE props, VALUE traits) {
-    static VALUE class_mapper = 0;
-    if(class_mapper == 0) class_mapper = rb_const_get(mRocketAMF, rb_intern("ClassMapper"));
+static VALUE ser3_write_object(VALUE self, VALUE obj, VALUE props, VALUE traits) {
     AMF_SERIALIZER *ser;
     Data_Get_Struct(self, AMF_SERIALIZER, ser);
     long i;
@@ -524,24 +432,25 @@ static VALUE ser3_write_object0(VALUE self, VALUE obj, VALUE props, VALUE traits
     ser_write_byte(ser, AMF3_OBJECT_MARKER);
 
     // Write object ref, or cache it
-    VALUE obj_id = rb_obj_id(obj);
     VALUE obj_index;
-    if(st_lookup(ser->obj_cache, obj_id, &obj_index)) {
+    if(st_lookup(ser->obj_cache, obj, &obj_index)) {
         ser_write_int(ser, FIX2INT(obj_index) << 1);
         return self;
     } else {
-        st_add_direct(ser->obj_cache, obj_id, LONG2FIX(ser->obj_index));
+        st_add_direct(ser->obj_cache, obj, LONG2FIX(ser->obj_index));
         ser->obj_index++;
     }
 
     // Extract traits data, or use defaults
+    VALUE is_default = Qfalse;
     VALUE class_name = Qnil;
     VALUE members = Qnil;
     long members_len = 0;
     VALUE dynamic = Qtrue;
     VALUE externalizable = Qfalse;
     if(traits == Qnil) {
-        class_name = rb_funcall(class_mapper, id_get_as_class_name, 1, obj);
+        class_name = rb_funcall(ser->class_mapper, id_get_as_class_name, 1, obj);
+        if(class_name == Qnil) is_default = Qtrue;
     } else {
         class_name = rb_hash_aref(traits, sym_class_name);
         members = rb_hash_aref(traits, sym_members);
@@ -553,12 +462,13 @@ static VALUE ser3_write_object0(VALUE self, VALUE obj, VALUE props, VALUE traits
     // Handle trait caching
     int did_ref = 0;
     VALUE trait_index;
-    if(class_name != Qnil) {
-        if(st_lookup(ser->trait_cache, (st_data_t)RSTRING_PTR(class_name), &trait_index)) {
+    if(is_default == Qtrue || class_name != Qnil) {
+        const char *ref_class_name = is_default == Qtrue ? "__default__" : RSTRING_PTR(class_name);
+        if(st_lookup(ser->trait_cache, (st_data_t)ref_class_name, &trait_index)) {
             ser_write_int(ser, FIX2INT(trait_index) << 2 | 0x01);
             did_ref = 1;
         } else {
-            st_add_direct(ser->trait_cache, (st_data_t)strdup(RSTRING_PTR(class_name)), LONG2FIX(ser->trait_index));
+            st_add_direct(ser->trait_cache, (st_data_t)strdup(ref_class_name), LONG2FIX(ser->trait_index));
             ser->trait_index++;
         }
     }
@@ -589,7 +499,7 @@ static VALUE ser3_write_object0(VALUE self, VALUE obj, VALUE props, VALUE traits
 
     // Make a request for props hash unless we already have it
     if(props == Qnil) {
-        props = rb_funcall(class_mapper, id_props_for_serialization, 1, obj);
+        props = rb_funcall(ser->class_mapper, id_props_for_serialization, 1, obj);
     }
 
     // Write sealed members
@@ -601,18 +511,16 @@ static VALUE ser3_write_object0(VALUE self, VALUE obj, VALUE props, VALUE traits
 
     // Write dynamic properties
     if(dynamic == Qtrue) {
-        ITER_ARGS args;
-        args.ser = self;
-        args.extra = skipped_members;
+        VALUE args[2] = {self, skipped_members};
 #ifdef SORT_PROPS
         // Sort is required prior to Ruby 1.9 to pass all the tests, as Ruby 1.8 hashes don't store insert order
         VALUE sorted_props = rb_funcall(props, rb_intern("sort"), 0);
         for(i = 0; i < RARRAY_LEN(sorted_props); i++) {
             VALUE pair = RARRAY_PTR(sorted_props)[i];
-            ser3_hash_iter(RARRAY_PTR(pair)[0], RARRAY_PTR(pair)[1], &args);
+            ser3_hash_iter(RARRAY_PTR(pair)[0], RARRAY_PTR(pair)[1], args);
         }
 #else
-        rb_hash_foreach(props, ser3_hash_iter, (st_data_t)&args);
+        rb_hash_foreach(props, ser3_hash_iter, (st_data_t)args);
 #endif
 
         ser_write_byte(ser, AMF3_CLOSE_DYNAMIC_OBJECT);
@@ -621,48 +529,27 @@ static VALUE ser3_write_object0(VALUE self, VALUE obj, VALUE props, VALUE traits
     return self;
 }
 
-/*
- * call-seq:
- *   ser.write_object(obj, props=nil, traits=nil) => ser
- *
- * Write the given object or hash using AMF3 notation. If given a props hash,
- * uses that instead of using the class mapper to calculate it. If given a traits
- * hash, uses that instead of the default dynamic traits with the mapped class
- * name.
- */
-static VALUE ser3_write_object(int argc, VALUE *argv, VALUE self) {
-    // Check args
-    VALUE obj;
-    VALUE props = Qnil;
-    VALUE traits = Qnil;
-    rb_scan_args(argc, argv, "12", &obj, &props, &traits);
-
-    // Call to internal write_object
-    return ser3_write_object0(self, obj, props, traits);
-}
-
-static VALUE ser3_write_time(VALUE self, VALUE time) {
+static VALUE ser3_write_time(VALUE self, VALUE time_obj) {
     AMF_SERIALIZER *ser;
     Data_Get_Struct(self, AMF_SERIALIZER, ser);
 
     ser_write_byte(ser, AMF3_DATE_MARKER);
 
     // Write object ref, or cache it
-    VALUE obj_id = rb_obj_id(time);
     VALUE obj_index;
-    if(st_lookup(ser->obj_cache, obj_id, &obj_index)) {
+    if(st_lookup(ser->obj_cache, time_obj, &obj_index)) {
         ser_write_int(ser, FIX2INT(obj_index) << 1);
         return;
     } else {
-        st_add_direct(ser->obj_cache, obj_id, LONG2FIX(ser->obj_index));
+        st_add_direct(ser->obj_cache, time_obj, LONG2FIX(ser->obj_index));
         ser->obj_index++;
     }
 
     // Write time
     ser_write_byte(ser, AMF3_NULL_MARKER); // Ref header
-    time = rb_obj_dup(time);
-    rb_funcall(time, id_utc, 0);
-    long tmp_num = NUM2DBL(rb_funcall(time, id_to_f, 0)) * 1000;
+    time_obj = rb_obj_dup(time_obj);
+    rb_funcall(time_obj, id_utc, 0);
+    long tmp_num = NUM2DBL(rb_funcall(time_obj, id_to_f, 0)) * 1000;
     ser_write_double(ser, (double)tmp_num);
 }
 
@@ -673,13 +560,12 @@ static VALUE ser3_write_date(VALUE self, VALUE date) {
     ser_write_byte(ser, AMF3_DATE_MARKER);
 
     // Write object ref, or cache it
-    VALUE obj_id = rb_obj_id(date);
     VALUE obj_index;
-    if(st_lookup(ser->obj_cache, obj_id, &obj_index)) {
+    if(st_lookup(ser->obj_cache, date, &obj_index)) {
         ser_write_int(ser, FIX2INT(obj_index) << 1);
         return;
     } else {
-        st_add_direct(ser->obj_cache, obj_id, LONG2FIX(ser->obj_index));
+        st_add_direct(ser->obj_cache, date, LONG2FIX(ser->obj_index));
         ser->obj_index++;
     }
 
@@ -696,13 +582,12 @@ static VALUE ser3_write_byte_array(VALUE self, VALUE ba) {
     ser_write_byte(ser, AMF3_BYTE_ARRAY_MARKER);
 
     // Write object ref, or cache it
-    VALUE obj_id = rb_obj_id(ba);
     VALUE obj_index;
-    if(st_lookup(ser->obj_cache, obj_id, &obj_index)) {
+    if(st_lookup(ser->obj_cache, ba, &obj_index)) {
         ser_write_int(ser, FIX2INT(obj_index) << 1);
         return;
     } else {
-        st_add_direct(ser->obj_cache, obj_id, LONG2FIX(ser->obj_index));
+        st_add_direct(ser->obj_cache, ba, LONG2FIX(ser->obj_index));
         ser->obj_index++;
     }
 
@@ -712,20 +597,12 @@ static VALUE ser3_write_byte_array(VALUE self, VALUE ba) {
     rb_str_buf_cat(ser->stream, RSTRING_PTR(str), RSTRING_LEN(str));
 }
 
-VALUE ser3_serialize(VALUE self, VALUE obj) {
+/*
+ * Serializes the object to a string and returns that string
+ */
+static VALUE ser3_serialize(VALUE self, VALUE obj) {
     AMF_SERIALIZER *ser;
     Data_Get_Struct(self, AMF_SERIALIZER, ser);
-
-    if(ser->depth == 0) {
-        // Initialize caches
-        ser->str_cache = st_init_strtable();
-        ser->str_index = 0;
-        ser->trait_cache = st_init_strtable();
-        ser->trait_index = 0;
-        ser->obj_cache = st_init_numtable();
-        ser->obj_index = 0;
-    }
-    ser->depth++;
 
     int type = TYPE(obj);
     VALUE klass = Qnil;
@@ -738,20 +615,8 @@ VALUE ser3_serialize(VALUE self, VALUE obj) {
     } else if(type == T_STRING || type == T_SYMBOL) {
         ser_write_byte(ser, AMF3_STRING_MARKER);
         ser3_write_utf8vr(ser, obj);
-    } else if(type == T_FIXNUM) {
-        long tmp_num = FIX2LONG(obj);
-        if(tmp_num < MIN_INTEGER || tmp_num > MAX_INTEGER) {
-            // Outside range so convert to double and serialize as float
-            ser_write_byte(ser, AMF3_DOUBLE_MARKER);
-            ser_write_double(ser, (double)tmp_num);
-        } else {
-            // Inside valid integer range
-            ser_write_byte(ser, AMF3_INTEGER_MARKER);
-            ser_write_int(ser, (int)tmp_num);
-        }
-    } else if(type == T_FLOAT) {
-        ser_write_byte(ser, AMF3_DOUBLE_MARKER);
-        ser_write_double(ser, RFLOAT_VALUE(obj));
+    } else if(rb_obj_is_kind_of(obj, rb_cNumeric)) {
+        ser3_write_numeric(ser, obj);
     } else if(type == T_NIL) {
         ser_write_byte(ser, AMF3_NULL_MARKER);
     } else if(type == T_TRUE) {
@@ -761,56 +626,193 @@ VALUE ser3_serialize(VALUE self, VALUE obj) {
     } else if(type == T_ARRAY) {
         ser3_write_array(self, obj);
     } else if(type == T_HASH) {
-        ser3_write_object0(self, obj, Qnil, Qnil);
+        ser3_write_object(self, obj, Qnil, Qnil);
     } else if(klass == rb_cTime) {
         ser3_write_time(self, obj);
     } else if(klass == cDate || klass == cDateTime) {
         ser3_write_date(self, obj);
     } else if(klass == cStringIO) {
         ser3_write_byte_array(self, obj);
-    } else if(type == T_BIGNUM) {
-        ser_write_byte(ser, AMF3_DOUBLE_MARKER);
-        ser_write_double(ser, rb_big2dbl(obj));
     } else if(type == T_OBJECT) {
-        ser3_write_object0(self, obj, Qnil, Qnil);
+        ser3_write_object(self, obj, Qnil, Qnil);
     }
 
-    ser->depth--;
+    return ser->stream;
+}
 
+/*
+ * Mark ruby objects for GC
+ */
+static void ser_mark(AMF_SERIALIZER *ser) {
+    if(!ser) return;
+    rb_gc_mark(ser->class_mapper);
+    rb_gc_mark(ser->stream);
+}
+
+/*
+ * Free cache tables, stream and the struct itself
+ */
+static void ser_free(AMF_SERIALIZER *ser) {
+    if(ser->str_cache) st_free_table(ser->str_cache);
+    if(ser->trait_cache) st_free_table(ser->trait_cache);
+    if(ser->obj_cache) st_free_table(ser->obj_cache);
+    xfree(ser);
+}
+
+/*
+ * Create new struct and wrap with class
+ */
+static VALUE ser_alloc(VALUE klass) {
+    // Allocate struct
+    AMF_SERIALIZER *ser = ALLOC(AMF_SERIALIZER);
+    memset(ser, 0, sizeof(AMF_SERIALIZER));
+    return Data_Wrap_Struct(klass, ser_mark, ser_free, ser);
+}
+
+/*
+ * Initializer
+ */
+static VALUE ser_initialize(VALUE self, VALUE class_mapper) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+
+    ser->class_mapper = class_mapper;
+    ser->depth = 0;
+    ser->stream = rb_str_buf_new(0);
+
+    return self;
+}
+
+/*
+ * call-seq:
+ *   ser.version => int
+ *
+ * Returns the serializer version number, so that a custom encode_amf method
+ * knows which version to encode for
+ */
+static VALUE ser_version(VALUE self) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+    return INT2FIX(ser->version);
+}
+
+/*
+ * call-seq:
+ *   ser.stream => string
+ *
+ * Returns the string that the serializer is writing to
+ */
+static VALUE ser_stream(VALUE self) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+    return ser->stream;
+}
+
+/*
+ * call-seq:
+ *   ser.serialize(amf_ver, obj) => string
+ *
+ * Serialize the given object to the current stream and returns the stream
+ */
+VALUE ser_serialize(VALUE self, VALUE ver, VALUE obj) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+
+    // Process version
+    int int_ver = FIX2INT(ver);
+    if(int_ver != 0 && int_ver != 3) rb_raise(rb_eArgError, "unsupported version %d", int_ver);
+    ser->version = int_ver;
+
+    // Initialize caches
     if(ser->depth == 0) {
-        // Clean up
+        ser->obj_cache = st_init_numtable();
+        ser->obj_index = 0;
+        if(ser->version == 3) {
+            ser->str_cache = st_init_strtable();
+            ser->str_index = 0;
+            ser->trait_cache = st_init_strtable();
+            ser->trait_index = 0;
+        }
+    }
+    ser->depth++;
+
+    // Perform serialization
+    if(ser->version == 0) {
+        ser0_serialize(self, obj);
+    } else {
+        ser3_serialize(self, obj);
+    }
+
+    // Clean up
+    ser->depth--;
+    if(ser->depth == 0) {
+        xfree(ser->obj_cache);
+        ser->obj_cache = NULL;
         xfree(ser->str_cache);
         ser->str_cache = NULL;
         xfree(ser->trait_cache);
         ser->trait_cache = NULL;
-        xfree(ser->obj_cache);
-        ser->obj_cache = NULL;
     }
+
     return ser->stream;
+}
+
+/*
+ * call-seq:
+ *   ser.write_array(ary) => ser
+ *
+ * Serializes the given array to the serializer stream
+ */
+static VALUE ser_write_array(VALUE self, VALUE ary) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+    if(ser->version == 0) {
+        return ser0_write_array(self, ary);
+    } else {
+        return ser3_write_array(self, ary);
+    }
+}
+
+/*
+ * call-seq:
+ *   ser.write_object(obj, props=nil) => ser
+ *   ser.write_object(obj, props=nil, traits=nil) => ser
+ *
+ * Serializes the given object or hash to the serializer stream using
+ * the proper serializer version. If given a props hash, uses that
+ * instead of using the class mapper to calculate it. If given a traits
+ * hash for AMF3, uses that instead of the default dynamic traits with
+ * the mapped class name.
+ */
+static VALUE ser_write_object(int argc, VALUE *argv, VALUE self) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+
+    // Check args and call implementation
+    VALUE obj;
+    VALUE props = Qnil;
+    VALUE traits = Qnil;
+    if(ser->version == 0) {
+        rb_scan_args(argc, argv, "11", &obj, &props);
+        return ser0_write_object(self, obj, props);
+    } else {
+        rb_scan_args(argc, argv, "12", &obj, &props, &traits);
+        return ser3_write_object(self, obj, props, traits);
+    }
 }
 
 void Init_rocket_amf_serializer() {
     // Define Serializer
     cSerializer = rb_define_class_under(mRocketAMFExt, "Serializer", rb_cObject);
     rb_define_alloc_func(cSerializer, ser_alloc);
-    rb_define_method(cSerializer, "version", ser0_version, 0);
+    rb_define_method(cSerializer, "initialize", ser_initialize, 1);
+    rb_define_method(cSerializer, "version", ser_version, 0);
     rb_define_method(cSerializer, "stream", ser_stream, 0);
-    rb_define_method(cSerializer, "serialize", ser0_serialize, 1);
-    rb_define_method(cSerializer, "write_array", ser0_write_array, 1);
-    rb_define_method(cSerializer, "write_hash", ser0_write_object, -1);
-    rb_define_method(cSerializer, "write_object", ser0_write_object, -1);
-
-    // Define AMF3Serializer
-    cAMF3Serializer = rb_define_class_under(mRocketAMFExt, "AMF3Serializer", rb_cObject);
-    rb_define_alloc_func(cAMF3Serializer, ser_alloc);
-    rb_define_method(cAMF3Serializer, "version", ser3_version, 0);
-    rb_define_method(cAMF3Serializer, "stream", ser_stream, 0);
-    rb_define_method(cAMF3Serializer, "serialize", ser3_serialize, 1);
-    rb_define_method(cAMF3Serializer, "write_array", ser3_write_array, 1);
-    rb_define_method(cAMF3Serializer, "write_object", ser3_write_object, -1);
+    rb_define_method(cSerializer, "serialize", ser_serialize, 2);
+    rb_define_method(cSerializer, "write_array", ser_write_array, 1);
+    rb_define_method(cSerializer, "write_object", ser_write_object, -1);
 
     // Get refs to commonly used symbols and ids
-    id_size = rb_intern("size");
     id_haskey = rb_intern("has_key?");
     id_encode_amf = rb_intern("encode_amf");
     id_is_array_collection = rb_intern("is_array_collection?");
@@ -819,4 +821,5 @@ void Init_rocket_amf_serializer() {
     id_props_for_serialization = rb_intern("props_for_serialization");
     id_utc = rb_intern("utc");
     id_to_f = rb_intern("to_f");
+    id_is_integer = rb_intern("integer?");
 }

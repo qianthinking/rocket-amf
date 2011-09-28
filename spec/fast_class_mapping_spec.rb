@@ -1,16 +1,19 @@
 require "spec_helper.rb"
 
-describe RocketAMF::ClassMapping do
+describe RocketAMF::Ext::FastClassMapping do
   before :each do
-    @mapper = RocketAMF::ClassMapping.new
-    @mapper.define do |m|
+    RocketAMF::Ext::FastClassMapping.reset
+    RocketAMF::Ext::FastClassMapping.define do |m|
       m.map :as => 'ASClass', :ruby => 'ClassMappingTest'
     end
+    @mapper = RocketAMF::Ext::FastClassMapping.new
   end
 
   describe "class name mapping" do
     it "should allow resetting of mappings back to defaults" do
-      @mapper.reset
+      @mapper.get_as_class_name('ClassMappingTest').should_not be_nil
+      RocketAMF::Ext::FastClassMapping.reset
+      @mapper = RocketAMF::Ext::FastClassMapping.new
       @mapper.get_as_class_name('ClassMappingTest').should be_nil
       @mapper.get_as_class_name('RocketAMF::Values::AcknowledgeMessage').should_not be_nil
     end
@@ -27,7 +30,8 @@ describe RocketAMF::ClassMapping do
     end
 
     it "should properly instantiate namespaced classes" do
-      @mapper.define {|m| m.map :as => 'ASClass', :ruby => 'ANamespace::TestRubyClass'}
+      RocketAMF::Ext::FastClassMapping.mappings.map :as => 'ASClass', :ruby => 'ANamespace::TestRubyClass'
+      @mapper = RocketAMF::Ext::FastClassMapping.new
       @mapper.get_ruby_obj('ASClass').should be_a(ANamespace::TestRubyClass)
     end
 
@@ -61,9 +65,8 @@ describe RocketAMF::ClassMapping do
     end
 
     it "should allow config modification" do
-      @mapper.define do |m|
-        m.map :as => 'SecondClass', :ruby => 'ClassMappingTest'
-      end
+      RocketAMF::Ext::FastClassMapping.mappings.map :as => 'SecondClass', :ruby => 'ClassMappingTest'
+      @mapper = RocketAMF::Ext::FastClassMapping.new
       @mapper.get_as_class_name(ClassMappingTest.new).should == 'SecondClass'
     end
   end
@@ -78,31 +81,24 @@ describe RocketAMF::ClassMapping do
       obj = @mapper.populate_ruby_obj RocketAMF::Values::TypedHash.new('UnmappedClass'), {:prop_a => 'Data'}
       obj[:prop_a].should == 'Data'
     end
-
-    it "should allow custom populators" do
-      class CustomPopulator
-        def can_handle? obj
-          true
-        end
-        def populate obj, props, dynamic_props
-          obj[:populated] = true
-          obj.merge! props
-          obj.merge! dynamic_props if dynamic_props
-        end
-      end
-
-      @mapper.object_populators << CustomPopulator.new
-      obj = @mapper.populate_ruby_obj({}, {:prop_a => 'Data'})
-      obj[:populated].should == true
-      obj[:prop_a].should == 'Data'
-    end
   end
 
   describe "property extractor" do
-    it "should extract hash properties" do
+    # Use symbol keys for properties in Ruby >1.9
+    def prop_hash hash
+      out = {}
+      if RUBY_VERSION =~ /^1\.8/
+        hash.each {|k,v| out[k.to_s] = v}
+      else
+        hash.each {|k,v| out[k.to_sym] = v}
+      end
+      out
+    end
+
+    it "should return hash without modification" do
       hash = {:a => 'test1', 'b' => 'test2'}
       props = @mapper.props_for_serialization(hash)
-      props.should == {'a' => 'test1', 'b' => 'test2'}
+      props.should === hash
     end
 
     it "should extract object properties" do
@@ -110,7 +106,7 @@ describe RocketAMF::ClassMapping do
       obj.prop_a = 'Test A'
 
       hash = @mapper.props_for_serialization obj
-      hash.should == {'prop_a' => 'Test A', 'prop_b' => nil}
+      hash.should == prop_hash({'prop_a' => 'Test A', 'prop_b' => nil})
     end
 
     it "should extract inherited object properties" do
@@ -119,21 +115,30 @@ describe RocketAMF::ClassMapping do
       obj.prop_c = 'Test C'
 
       hash = @mapper.props_for_serialization obj
-      hash.should == {'prop_a' => 'Test A', 'prop_b' => nil, 'prop_c' => 'Test C'}
+      hash.should == prop_hash({'prop_a' => 'Test A', 'prop_b' => nil, 'prop_c' => 'Test C'})
     end
 
-    it "should allow custom serializers" do
-      class CustomSerializer
-        def can_handle? obj
-          true
-        end
-        def serialize obj
-          {:success => true}
-        end
-      end
+    it "should cache property lookups by instance" do
+      class ClassMappingTest3; attr_accessor :prop_a; end;
 
-      @mapper.object_serializers << CustomSerializer.new
-      @mapper.props_for_serialization(nil).should == {:success => true}
+      # Cache properties
+      obj = ClassMappingTest3.new
+      hash = @mapper.props_for_serialization obj
+
+      # Add a method to ClassMappingTest3
+      class ClassMappingTest3; attr_accessor :prop_b; end;
+
+      # Test property list does not have new property
+      obj = ClassMappingTest3.new
+      obj.prop_a = 'Test A'
+      obj.prop_b = 'Test B'
+      hash = @mapper.props_for_serialization obj
+      hash.should == prop_hash({'prop_a' => 'Test A'})
+
+      # Test that new class mapper *does* have new property (cache per instance)
+      @mapper = RocketAMF::Ext::FastClassMapping.new
+      hash = @mapper.props_for_serialization obj
+      hash.should == prop_hash({'prop_a' => 'Test A', 'prop_b' => 'Test B'})
     end
   end
 end

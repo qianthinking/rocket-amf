@@ -25,6 +25,50 @@ describe RocketAMF::Envelope do
     end
   end
 
+  describe 'request builder' do
+    it "should create simple call" do
+      req = RocketAMF::Envelope.new
+      req.call('TestController.test', 'first_arg', 'second_arg')
+
+      expected = request_fixture('simple-request.bin')
+      req.serialize.should == expected
+    end
+
+    it "should allow multiple simple calls" do
+      req = RocketAMF::Envelope.new
+      req.call('TestController.test', 'first_arg', 'second_arg')
+      req.call('TestController.test2', 'first_arg', 'second_arg')
+
+      expected = request_fixture('multiple-simple-request.bin')
+      req.serialize.should == expected
+    end
+
+    it "should create flex remoting call" do
+      req = RocketAMF::Envelope.new :amf_version => 3
+      req.call_flex('TestController.test', 'first_arg', 'second_arg')
+      req.messages[0].data.timestamp = 0
+      req.messages[0].data.messageId = "9D108E33-B591-BE79-210D-F1A72D06B578"
+
+      expected = request_fixture('flex-request.bin')
+      req.serialize.should == expected
+    end
+
+    it "should require AMF version 3 for remoting calls" do
+      req = RocketAMF::Envelope.new :amf_version => 0
+      lambda {
+        req.call_flex('TestController.test')
+      }.should raise_error("Cannot use flex remoting calls with AMF0")
+    end
+
+    it "should require all calls be the same type" do
+      req = RocketAMF::Envelope.new :amf_version => 0
+      lambda {
+        req.call('TestController.test')
+        req.call_flex('TestController.test')
+      }.should raise_error("Cannot use different call types")
+    end
+  end
+
   describe 'serializer' do
     it "should serialize response when converted to string" do
       res = RocketAMF::Envelope.new
@@ -112,6 +156,41 @@ describe RocketAMF::Envelope do
           true
         end
       }.should_not raise_error
+    end
+  end
+
+  describe 'response parser' do
+    it "should return the result of a simple response" do
+      req = RocketAMF::Envelope.new
+      req.call('TestController.test', 'first_arg', 'second_arg')
+      res = RocketAMF::Envelope.new
+      res.each_method_call req do |method, args|
+        ['a', 'b']
+      end
+
+      res.result.should == ['a', 'b']
+    end
+
+    it "should return the results of multiple simple response in a single request" do
+      req = RocketAMF::Envelope.new
+      req.call('TestController.test', 'first_arg', 'second_arg')
+      req.call('TestController.test2', 'first_arg', 'second_arg')
+      res = RocketAMF::Envelope.new
+      res.each_method_call req do |method, args|
+        ['a', 'b']
+      end
+
+      res.result.should == [['a', 'b'], ['a', 'b']]
+    end
+
+    it "should return the results of a flex response" do
+      req = RocketAMF::Envelope.new :amf_version => 3
+      req.call_flex('TestController.test', 'first_arg', 'second_arg')
+      res = RocketAMF::Envelope.new
+      res.each_method_call req do |method, args|
+        ['a', 'b']
+      end
+      res.result.should == ['a', 'b']
     end
   end
 end

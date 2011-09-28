@@ -8,21 +8,48 @@ require 'rocketamf/class_mapping'
 require 'rocketamf/constants'
 require 'rocketamf/remoting'
 
-# RocketAMF is a full featured AMF0/3 serializer and deserializer with support
-# for Flash -> Ruby and Ruby -> Flash class mapping, custom serializers,
-# remoting gateway helpers that follow AMF0/3 messaging specs, and a suite of
-# specs to ensure adherence to the specification documents put out by Adobe.
+# RocketAMF is a full featured AMF0/3 serializer and deserializer with support for
+# bi-directional Flash to Ruby class mapping, custom serialization and mapping,
+# remoting gateway helpers that follow AMF0/3 messaging specs, and a suite of specs
+# to ensure adherence to the specification documents put out by Adobe. If the C
+# components compile, then RocketAMF automatically takes advantage of them to
+# provide a substantial performance benefit. In addition, RocketAMF is fully
+# compatible with Ruby 1.9.
+#
+# == Performance
+#
+# RocketAMF provides native C extensions for serialization, deserialization,
+# remoting, and class mapping. If your environment supports them, RocketAMF will
+# automatically take advantage of the C serializer, deserializer, and remoting
+# support. The C class mapper has some substantial performance optimizations that
+# make it incompatible with the pure Ruby class mapper, and so it must be manually
+# enabled. For more information see <tt>RocketAMF::ClassMapping</tt>. Below are
+# some benchmarks I took using using a simple little benchmarking utility I whipped
+# up, which can be found in the root of the repository.
+#
+#   # 100000 objects
+#   # Ruby 1.8
+#   Testing native AMF0:
+#     minimum serialize time: 1.229868s
+#     minimum deserialize time: 0.86465s
+#   Testing native AMF3:
+#     minimum serialize time: 1.444652s
+#     minimum deserialize time: 0.879407s
+#   Testing pure AMF0:
+#     minimum serialize time: 25.427931s
+#     minimum deserialize time: 11.706084s
+#   Testing pure AMF3:
+#     minimum serialize time: 31.637864s
+#     minimum deserialize time: 14.773969s
 #
 # == Serialization & Deserialization
 #
-# RocketAMF provides two main methods - <tt>RocketAMF.serialize(obj, amf_version=0)</tt>
-# and <tt>RocketAMF.deserialize(source, amf_version=0)</tt>. To use, simple pass
-# in the string to deserialize and the version if different from the default. To
-# serialize an object, simply call <tt>RocketAMF.serialize</tt> with the object
-# and the proper version. If you're working only with AS3, it is more effiecient
-# to use the version 3 encoding, as it caches duplicate string to reduce
-# serialized size. However for greater compatibility the default, AMF version 0,
-# should work fine.
+# RocketAMF provides two main methods - <tt>serialize</tt> and <tt>deserialize</tt>.
+# Deserialization takes a String or StringIO object and the AMF version if different
+# from the default. Serialization takes any Ruby object and the version if different
+# from the default. Both default to AMF0, as it's more widely supported and slightly
+# faster, but AMF3 does a better job of not sending duplicate data. Which you choose
+# depends on what you need to communicate with and how much serialized size matters.
 #
 # == Mapping Classes Between Flash and Ruby
 #
@@ -36,8 +63,9 @@ require 'rocketamf/remoting'
 # == Remoting
 #
 # You can use RocketAMF bare to write an AMF gateway using the following code.
-# In addition, you can use rack-amf (http://github.com/warhammerkid/rack-amf)
-# which simplifies the code necessary to set up a functioning AMF gateway.
+# In addition, you can use rack-amf (http://github.com/rubyamf/rack-amf) or
+# RubyAMF (http://github.com/rubyamf/rubyamf), both of which provide rack-compliant
+# AMF gateways.
 #
 #   # helloworld.ru
 #   require 'rocketamf'
@@ -75,6 +103,78 @@ require 'rocketamf/remoting'
 #   end
 #
 #   run HelloWorldApp.new
+#
+# == Advanced Serialization (encode_amf and IExternalizable)
+#
+# RocketAMF provides some additional functionality to support advanced
+# serialization techniques. If you define an <tt>encode_amf</tt> method on your
+# object, it will get called during serialization. It is passed a single argument,
+# the serializer, and it can use the serializer stream, the <tt>serialize</tt>
+# method, the <tt>write_array</tt> method, the <tt>write_object</tt> method, and
+# the serializer version. Below is a simple example that uses <tt>write_object</tt>
+# to customize the property hash that is used for serialization.
+#
+# Example:
+#
+#   class TestObject
+#     def encode_amf ser
+#       ser.write_object self, @attributes
+#     end
+#   end
+#
+# If you plan on using the <tt>serialize</tt> method, make sure to pass in the
+# current serializer version, or you could create a message that cannot be deserialized.
+#
+# Example:
+#
+#   class VariableObject
+#     def encode_amf ser
+#       if ser.version == 0
+#         ser.serialize 0, true
+#       else
+#         ser.serialize 3, false
+#       end
+#     end
+#   end
+#
+# If you wish to send and receive IExternalizable objects, you will need to
+# implement <tt>encode_amf</tt>, <tt>read_external</tt>, and <tt>write_external</tt>.
+# Below is an example of a ResultSet class that extends Array and serializes as
+# an array collection. RocketAMF can automatically serialize arrays as
+# ArrayCollection objects, so this is just an example of how you might implement
+# an object that conforms to IExternalizable.
+#
+# Example:
+#
+#   class ResultSet < Array
+#     def encode_amf ser
+#       if ser.version == 0
+#         # Serialize as simple array in AMF0
+#         ser.write_array self
+#       else
+#         # Serialize as an ArrayCollection object
+#         # It conforms to IExternalizable, does not have any dynamic properties,
+#         # and has no "sealed" members. See the AMF3 specs for more details about
+#         # object traits.
+#         ser.write_object self, nil, {
+#           :class_name => "flex.messaging.io.ArrayCollection",
+#           :externalizable => true,
+#           :dynamic => false,
+#           :members => []
+#         }
+#       end
+#     end
+#   
+#     # Write self as array to stream
+#     def write_external ser
+#       ser.write_array(self)
+#     end
+#   
+#     # Read array out and replace data with deserialized array.
+#     def read_external des
+#       replace(des.read_object)
+#     end
+#   end
 module RocketAMF
   #begin
   #  require 'rocketamf/ext'
@@ -83,27 +183,21 @@ module RocketAMF
   #end
 
   # Deserialize the AMF string _source_ of the given AMF version into a Ruby
-  # data structure and return it
+  # data structure and return it. Creates an instance of <tt>RocketAMF::Deserializer</tt>
+  # with a new instance of <tt>RocketAMF::ClassMapper</tt> and calls deserialize
+  # on it with the given source and amf version, returning the result.
   def self.deserialize source, amf_version = 0
-    if amf_version == 0
-      RocketAMF::Deserializer.new.deserialize(source)
-    elsif amf_version == 3
-      RocketAMF::AMF3Deserializer.new.deserialize(source)
-    else
-      raise AMFError, "unsupported version #{amf_version}"
-    end
+    des = RocketAMF::Deserializer.new(RocketAMF::ClassMapper.new)
+    des.deserialize(amf_version, source)
   end
 
   # Serialize the given Ruby data structure _obj_ into an AMF stream using the
-  # given AMF version
+  # given AMF version. Creates an instance of <tt>RocketAMF::Serializer</tt>
+  # with a new instance of <tt>RocketAMF::ClassMapper</tt> and calls serialize
+  # on it with the given object and amf version, returning the result.
   def self.serialize obj, amf_version = 0
-    if amf_version == 0
-      RocketAMF::Serializer.new.serialize(obj)
-    elsif amf_version == 3
-      RocketAMF::AMF3Serializer.new.serialize(obj)
-    else
-      raise AMFError, "unsupported version #{amf_version}"
-    end
+    ser = RocketAMF::Serializer.new(RocketAMF::ClassMapper.new)
+    ser.serialize(amf_version, obj)
   end
 
   # We use const_missing to define the active ClassMapper at runtime. This way,
@@ -111,7 +205,7 @@ module RocketAMF
   # forcing extenders to redefine the constant.
   def self.const_missing const #:nodoc:
     if const == :ClassMapper
-      RocketAMF.const_set(:ClassMapper, RocketAMF::ClassMapping.new)
+      RocketAMF.const_set(:ClassMapper, RocketAMF::ClassMapping)
     else
       super(const)
     end
