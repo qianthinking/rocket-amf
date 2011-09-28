@@ -403,7 +403,12 @@ static VALUE des3_read_object(VALUE self) {
         if(externalizable == Qtrue) {
             rb_funcall(des->src, rb_intern("pos="), 1, LONG2NUM(des->pos)); // Update source StringIO pos
             rb_funcall(obj, rb_intern("read_external"), 1, self);
-            des->pos = NUM2LONG(rb_funcall(des->src, rb_intern("pos"), 0)); // Update from source
+            int src_pos = NUM2LONG(rb_funcall(des->src, rb_intern("pos"), 0));
+            if (src_pos > des->pos) {
+              des->pos = src_pos; // Update from source
+            } else if (src_pos < des->pos) {
+              rb_funcall(des->src, rb_intern("pos="), 1, LONG2NUM(des->pos)); // Update source StringIO pos
+            }
             return obj;
         }
 
@@ -715,6 +720,94 @@ VALUE des_read_object(VALUE self) {
     return ret;
 }
 
+VALUE new_read_int(VALUE self) {
+    AMF_DESERIALIZER *des;
+    Data_Get_Struct(self, AMF_DESERIALIZER, des);
+    DES_BOUNDS_CHECK(des, 4);
+    const unsigned char *str = des->stream + des->pos;
+    des->pos += 4;
+    int num = ((str[0] << 24) | (str[1] << 16) | (str[2] << 8) | str[3]);
+    VALUE result = INT2FIX(num);
+    return result;
+}
+
+VALUE new_read_ushort(VALUE self) {
+    AMF_DESERIALIZER *des;
+    Data_Get_Struct(self, AMF_DESERIALIZER, des);
+    DES_BOUNDS_CHECK(des, 2);
+    const unsigned char *str = des->stream + des->pos;
+    des->pos += 2;
+    unsigned short num = ((str[0] << 8) | str[1]);
+    VALUE result = INT2FIX(num);
+    return result;
+}
+
+VALUE new_read_float(VALUE self) {
+    AMF_DESERIALIZER *des;
+    Data_Get_Struct(self, AMF_DESERIALIZER, des);
+    DES_BOUNDS_CHECK(des, 4);
+    union aligned {
+        float fval;
+        char cval[4];
+    } f;
+    const char *str = des->stream + des->pos;
+    des->pos +=4;
+#ifdef WORDS_BIGENDIAN
+    memcpy(f.cval, str, 4);
+#else
+    f.cval[0] = str[3];
+    f.cval[1] = str[2];
+    f.cval[2] = str[1];
+    f.cval[3] = str[0];
+#endif
+    VALUE result = DBL2NUM(f.fval);
+    return result;
+}
+
+VALUE new_read_utf8(VALUE self) {
+    AMF_DESERIALIZER *des;
+    Data_Get_Struct(self, AMF_DESERIALIZER, des);
+    DES_BOUNDS_CHECK(des, 2);
+    const unsigned char *str = des->stream + des->pos;
+    des->pos += 2;
+    unsigned short len = ((str[0] << 8) | str[1]);
+    DES_BOUNDS_CHECK(des, len);
+    VALUE result = rb_str_new(des->stream + des->pos, len);
+#ifdef HAVE_RB_STR_ENCODE
+    rb_encoding *utf8 = rb_utf8_encoding();
+    rb_enc_associate(result, utf8);
+    ENC_CODERANGE_CLEAR(result);
+#endif
+    des->pos += len;
+    return result;
+}
+
+VALUE new_read_boolean(VALUE self) {
+    AMF_DESERIALIZER *des;
+    Data_Get_Struct(self, AMF_DESERIALIZER, des);
+    VALUE ret = des_read_byte(des) == 0 ? Qfalse : Qtrue;
+    return ret;
+}
+
+
+VALUE new_read_obj(VALUE self) {
+    AMF_DESERIALIZER *des;
+    Data_Get_Struct(self, AMF_DESERIALIZER, des);
+
+    // Deserialize
+    VALUE ret;
+    if(des->version == 0) {
+        ret = des0_deserialize(self, des_read_byte(des));
+    } else {
+        ret = des3_deserialize(self);
+    }
+    // Update source position
+    rb_funcall(des->src, rb_intern("pos="), 1, LONG2NUM(des->pos)); // Update source StringIO pos
+
+    return ret;
+}
+
+
 void Init_rocket_amf_deserializer() {
     // Define Deserializer
     cDeserializer = rb_define_class_under(mRocketAMFExt, "Deserializer", rb_cObject);
@@ -723,6 +816,13 @@ void Init_rocket_amf_deserializer() {
     rb_define_method(cDeserializer, "source", des_source, 0);
     rb_define_method(cDeserializer, "deserialize", des_deserialize, 2);
     rb_define_method(cDeserializer, "read_object", des_read_object, 0);
+
+    rb_define_method(cDeserializer, "read_int", new_read_int, 0);
+    rb_define_method(cDeserializer, "read_ushort", new_read_ushort, 0);
+    rb_define_method(cDeserializer, "read_float", new_read_float, 0);
+    rb_define_method(cDeserializer, "read_utf8", new_read_utf8, 0);
+    rb_define_method(cDeserializer, "read_boolean", new_read_boolean, 0);
+    rb_define_method(cDeserializer, "read_obj", new_read_obj, 0);
 
     // Get refs to commonly used symbols and ids
     id_get_ruby_obj = rb_intern("get_ruby_obj");

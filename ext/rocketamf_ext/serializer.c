@@ -1,6 +1,7 @@
 #include "serializer.h"
 #include "constants.h"
 #include "utility.h"
+#include <arpa/inet.h>
 
 extern VALUE mRocketAMF;
 extern VALUE mRocketAMFExt;
@@ -25,6 +26,8 @@ ID id_is_integer;
 
 static VALUE ser0_serialize(VALUE self, VALUE obj);
 static VALUE ser3_serialize(VALUE self, VALUE obj);
+
+const char*  obj_inspect(VALUE);
 
 void ser_write_byte(AMF_SERIALIZER *ser, char byte) {
     char bytes[2] = {byte, '\0'};
@@ -165,8 +168,16 @@ static int ser0_hash_iter(VALUE key, VALUE val, const VALUE args[1]) {
     AMF_SERIALIZER *ser;
     Data_Get_Struct(args[0], AMF_SERIALIZER, ser);
 
+    int type = TYPE(key);
+    // Technically incorrect if key length is longer than a 16 bit string, but if you run into that you're screwed anyways
+    if(type != T_STRING) {
+       VALUE new_key = rb_funcall(key, rb_intern("to_s"), 0);
+       ser0_write_string(ser, new_key, Qfalse); 
+    } else {
+       ser0_write_string(ser, key, Qfalse);
+    }
+
     // Write key and value
-    ser0_write_string(ser, key, Qfalse); // Technically incorrect if key length is longer than a 16 bit string, but if you run into that you're screwed anyways
     ser0_serialize(args[0], val);
 
     return ST_CONTINUE;
@@ -409,7 +420,14 @@ static int ser3_hash_iter(VALUE key, VALUE val, const VALUE args[2]) {
 
     if(args[1] == Qnil || rb_funcall(args[1], id_haskey, 1, key) == Qfalse) {
         // Write key and value
-        ser3_write_utf8vr(ser, key);
+        int type = TYPE(key);
+        // Technically incorrect if key length is longer than a 16 bit string, but if you run into that you're screwed anyways
+        if(type != T_STRING) {
+            VALUE new_key = rb_funcall(key, rb_intern("to_s"), 0);
+            ser3_write_utf8vr(ser, new_key);
+        } else {
+            ser3_write_utf8vr(ser, key);
+        }
         ser3_serialize(args[0], val);
     }
     return ST_CONTINUE;
@@ -800,6 +818,79 @@ static VALUE ser_write_object(int argc, VALUE *argv, VALUE self) {
         return ser3_write_object(self, obj, props, traits);
     }
 }
+const char*  obj_inspect(VALUE obj) {
+    VALUE str = rb_funcall(obj, rb_intern("inspect"), 0);
+    const char * result = RSTRING_PTR(str);
+    return result;
+}
+
+void new_write_int(VALUE self, VALUE num) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+
+    int int_val = htonl(FIX2INT(num));
+    rb_str_buf_cat(ser->stream, &int_val, 4);
+}
+void new_write_ushort(VALUE self, VALUE num) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+
+    unsigned short int_val = htons(FIX2INT(num));
+    rb_str_buf_cat(ser->stream, &int_val, 2);
+}
+
+void new_write_utf8(VALUE self, VALUE obj) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+    char* str;
+    long len;
+    ser_get_string(obj, Qtrue, &str, &len);
+    if(len > 65535) {
+        rb_raise(rb_eArgError, "length %d should not exceed 65535", len);
+    }
+    unsigned short int_val = htons(len);
+    rb_str_buf_cat(ser->stream, &int_val, 2);
+    rb_str_buf_cat(ser->stream, str, len);
+}
+
+void new_write_boolean(VALUE self, VALUE obj) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+    int type = TYPE(obj);
+    ser_write_byte(ser, type == T_TRUE ? 1 : 0);
+}
+
+void new_write_obj(VALUE self, VALUE obj) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+    if(ser->version == 0) {
+        ser0_serialize(self, obj);
+    } else {
+        ser3_serialize(self, obj);
+    }
+}
+
+new_write_float(VALUE self, VALUE num) {
+    AMF_SERIALIZER *ser;
+    Data_Get_Struct(self, AMF_SERIALIZER, ser);
+    float float_val = NUM2DBL(num);
+	union aligned {
+		float fval;
+		char cval[4];
+	} f;
+	const char *number = f.cval;
+	f.fval = float_val;
+
+#ifdef WORDS_BIGENDIAN
+    rb_str_buf_cat(ser->stream, number, 4);
+#else
+    char netnum[4] = {number[3],number[2],number[1],number[0]};
+    rb_str_buf_cat(ser->stream, netnum, 4);
+#endif
+}
+
+void st_add_direct(st_table *, st_data_t, st_data_t) {
+}
 
 void Init_rocket_amf_serializer() {
     // Define Serializer
@@ -811,6 +902,12 @@ void Init_rocket_amf_serializer() {
     rb_define_method(cSerializer, "serialize", ser_serialize, 2);
     rb_define_method(cSerializer, "write_array", ser_write_array, 1);
     rb_define_method(cSerializer, "write_object", ser_write_object, -1);
+    rb_define_method(cSerializer, "write_int", new_write_int, 1);
+    rb_define_method(cSerializer, "write_ushort", new_write_ushort, 1);
+    rb_define_method(cSerializer, "write_float", new_write_float, 1);
+    rb_define_method(cSerializer, "write_utf8", new_write_utf8, 1);
+    rb_define_method(cSerializer, "write_boolean", new_write_boolean, 1);
+    rb_define_method(cSerializer, "write_obj", new_write_obj, 1);
 
     // Get refs to commonly used symbols and ids
     id_haskey = rb_intern("has_key?");

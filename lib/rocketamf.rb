@@ -176,11 +176,11 @@ require 'rocketamf/remoting'
 #     end
 #   end
 module RocketAMF
-  #begin
-  #  require 'rocketamf/ext'
-  #rescue LoadError
-    require 'rocketamf/pure'
-  #end
+  begin
+    require 'rocketamf/ext'
+  rescue LoadError
+   require 'rocketamf/pure'
+  end
 
   # Deserialize the AMF string _source_ of the given AMF version into a Ruby
   # data structure and return it. Creates an instance of <tt>RocketAMF::Deserializer</tt>

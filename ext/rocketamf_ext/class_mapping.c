@@ -285,7 +285,11 @@ static VALUE mapping_as_class_name(VALUE self, VALUE obj) {
         class_name = rb_class2name(klass);
         if(klass == cTypedHash) {
             VALUE orig_name = rb_funcall(obj, rb_intern("type"), 0);
-            class_name = RSTRING_PTR(orig_name);
+            if (orig_name == Qnil) {
+                return Qnil;
+            } else {
+                class_name = RSTRING_PTR(orig_name);
+            }
         } else if(type == T_HASH) {
             // Don't bother looking up hash mapping, but need to check class name first in case it's a typed hash
             return Qnil;
