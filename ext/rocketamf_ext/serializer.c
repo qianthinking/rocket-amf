@@ -28,6 +28,7 @@ static VALUE ser0_serialize(VALUE self, VALUE obj);
 static VALUE ser3_serialize(VALUE self, VALUE obj);
 
 const char*  obj_inspect(VALUE);
+void new_add_direct(AMF_SERIALIZER *, st_table *, st_data_t, st_data_t);
 
 void ser_write_byte(AMF_SERIALIZER *ser, char byte) {
     char bytes[2] = {byte, '\0'};
@@ -124,7 +125,7 @@ static VALUE ser0_write_array(VALUE self, VALUE ary) {
     Data_Get_Struct(self, AMF_SERIALIZER, ser);
 
     // Cache it
-    st_add_direct(ser->obj_cache, ary, LONG2FIX(ser->obj_index));
+    new_add_direct(ser, ser->obj_cache, ary, LONG2FIX(ser->obj_index));
     ser->obj_index++;
 
     // Write it out
@@ -194,7 +195,7 @@ static VALUE ser0_write_object(VALUE self, VALUE obj, VALUE props) {
     Data_Get_Struct(self, AMF_SERIALIZER, ser);
 
     // Cache it
-    st_add_direct(ser->obj_cache, obj, LONG2FIX(ser->obj_index));
+    new_add_direct(ser, ser->obj_cache, obj, LONG2FIX(ser->obj_index));
     ser->obj_index++;
 
     // Make a request for props hash unless we already have it
@@ -376,7 +377,7 @@ static VALUE ser3_write_array(VALUE self, VALUE ary) {
         ser_write_int(ser, FIX2INT(obj_index) << 1);
         return self;
     } else {
-        st_add_direct(ser->obj_cache, ary, LONG2FIX(ser->obj_index));
+        new_add_direct(ser, ser->obj_cache, ary, LONG2FIX(ser->obj_index));
         ser->obj_index++;
         if(is_ac) ser->obj_index++; // The array collection source array
     }
@@ -455,7 +456,7 @@ static VALUE ser3_write_object(VALUE self, VALUE obj, VALUE props, VALUE traits)
         ser_write_int(ser, FIX2INT(obj_index) << 1);
         return self;
     } else {
-        st_add_direct(ser->obj_cache, obj, LONG2FIX(ser->obj_index));
+        new_add_direct(ser, ser->obj_cache, obj, LONG2FIX(ser->obj_index));
         ser->obj_index++;
     }
 
@@ -559,7 +560,7 @@ static VALUE ser3_write_time(VALUE self, VALUE time_obj) {
         ser_write_int(ser, FIX2INT(obj_index) << 1);
         return;
     } else {
-        st_add_direct(ser->obj_cache, time_obj, LONG2FIX(ser->obj_index));
+        new_add_direct(ser, ser->obj_cache, time_obj, LONG2FIX(ser->obj_index));
         ser->obj_index++;
     }
 
@@ -583,7 +584,7 @@ static VALUE ser3_write_date(VALUE self, VALUE date) {
         ser_write_int(ser, FIX2INT(obj_index) << 1);
         return;
     } else {
-        st_add_direct(ser->obj_cache, date, LONG2FIX(ser->obj_index));
+        new_add_direct(ser, ser->obj_cache, date, LONG2FIX(ser->obj_index));
         ser->obj_index++;
     }
 
@@ -605,7 +606,7 @@ static VALUE ser3_write_byte_array(VALUE self, VALUE ba) {
         ser_write_int(ser, FIX2INT(obj_index) << 1);
         return;
     } else {
-        st_add_direct(ser->obj_cache, ba, LONG2FIX(ser->obj_index));
+        new_add_direct(ser, ser->obj_cache, ba, LONG2FIX(ser->obj_index));
         ser->obj_index++;
     }
 
@@ -665,6 +666,7 @@ static void ser_mark(AMF_SERIALIZER *ser) {
     if(!ser) return;
     rb_gc_mark(ser->class_mapper);
     rb_gc_mark(ser->stream);
+    rb_gc_mark(ser->object_keeper);
 }
 
 /*
@@ -697,6 +699,7 @@ static VALUE ser_initialize(VALUE self, VALUE class_mapper) {
     ser->class_mapper = class_mapper;
     ser->depth = 0;
     ser->stream = rb_str_buf_new(0);
+    ser->object_keeper = rb_ary_new();
 
     return self;
 }
@@ -889,7 +892,9 @@ new_write_float(VALUE self, VALUE num) {
 #endif
 }
 
-void st_add_direct(st_table *, st_data_t, st_data_t) {
+void new_add_direct(AMF_SERIALIZER *ser, st_table * table, st_data_t key, st_data_t value) {
+    rb_ary_push(ser->object_keeper, key);
+    st_add_direct(table, key, value);
 }
 
 void Init_rocket_amf_serializer() {

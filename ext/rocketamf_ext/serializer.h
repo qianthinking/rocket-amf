@@ -10,6 +10,7 @@ typedef struct {
     int version;
     VALUE class_mapper;
     VALUE stream;
+    VALUE object_keeper;
     long depth;
     st_table* str_cache;
     long str_index;
