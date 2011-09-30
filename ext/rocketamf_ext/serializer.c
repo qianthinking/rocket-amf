@@ -767,12 +767,18 @@ VALUE ser_serialize(VALUE self, VALUE ver, VALUE obj) {
     // Clean up
     ser->depth--;
     if(ser->depth == 0) {
-        xfree(ser->obj_cache);
-        ser->obj_cache = NULL;
-        xfree(ser->str_cache);
-        ser->str_cache = NULL;
-        xfree(ser->trait_cache);
-        ser->trait_cache = NULL;
+        if(ser->obj_cache) {
+          st_free_table(ser->obj_cache);
+          ser->obj_cache = NULL;
+        }
+        if(ser->str_cache) {
+          st_free_table(ser->str_cache);
+          ser->str_cache = NULL;
+        }
+        if(ser->trait_cache) {
+          st_free_table(ser->trait_cache);
+          ser->trait_cache = NULL;
+        }
     }
 
     return ser->stream;
